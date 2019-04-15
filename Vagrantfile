@@ -3,47 +3,62 @@
 
 servers = [
     {
-        :name => "k8s-head",
+        :name => "k8s-master",
         :type => "master",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
-        :eth1 => "192.168.205.10",
-        :mem => "2048",
-        :cpu => "2"
-    },
-    {
-        :name => "k8s-node-1",
-        :type => "node",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
-        :eth1 => "192.168.205.11",
-        :mem => "2048",
-        :cpu => "2"
-    },
-    {
-        :name => "k8s-node-2",
-        :type => "node",
-        :box => "ubuntu/xenial64",
-        :box_version => "20180831.0.0",
-        :eth1 => "192.168.205.12",
-        :mem => "2048",
+        :box => "ubuntu/bionic64",
+        #:box_version => "v20190411.0.0",
+        :eth1 => "192.168.56.100",
+        :mem => "4096",
         :cpu => "2"
     }
+    # {
+    #     :name => "k8s-node-1",
+    #     :type => "node",
+    #     :box => "ubuntu/bionic64",
+    #     #:box_version => "v20190411.0.0",
+    #     :eth1 => "192.168.56.101",
+    #     :mem => "4096",
+    #     :cpu => "1"
+    # },
+    # {
+    #     :name => "k8s-node-2",
+    #     :type => "node",
+    #     :box => "ubuntu/bionic64",
+    #     #:box_version => "v20190411.0.0",
+    #     :eth1 => "192.168.56.102",
+    #     :mem => "4096",
+    #     :cpu => "1"
+    # }
 ]
 
 # This script to install k8s using kubeadm will get executed after a box is provisioned
 $configureBox = <<-SCRIPT
 
-    # install docker v17.03
+    # add proxy
+    export http_proxy='http://192.168.56.1:1080/'
+    export https_proxy='http://192.168.56.1:1080/'
+
+    # install docker latest
     # reason for not using docker provision is that it always installs latest version of the docker, but kubeadm requires 17.03 or older
     apt-get update
     apt-get install -y apt-transport-https ca-certificates curl software-properties-common
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-    add-apt-repository "deb https://download.docker.com/linux/$(. /etc/os-release; echo "$ID") $(lsb_release -cs) stable"
-    apt-get update && apt-get install -y docker-ce=$(apt-cache madison docker-ce | grep 17.03 | head -1 | awk '{print $3}')
+
+    curl -fsSL https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu/gpg | sudo apt-key add -
+    add-apt-repository "deb [arch=amd64] https://mirrors.ustc.edu.cn/docker-ce/linux/ubuntu $(lsb_release -cs) stable"
+
+    apt-get update
+    apt-get install -y docker-ce
 
     # run docker commands as vagrant user (sudo not required)
     usermod -aG docker vagrant
+
+    mkdir -p /etc/systemd/system/docker.service.d
+    cat <<EOF >/etc/systemd/system/docker.service.d/http-proxy.conf
+    [Service]
+    Environment="HTTP_PROXY=http://192.168.56.1:1080/"
+    Environment="HTTPS_PROXY=http://192.168.56.1:1080/"
+EOF
 
     # install kubeadm
     apt-get install -y apt-transport-https curl
@@ -51,6 +66,7 @@ $configureBox = <<-SCRIPT
     cat <<EOF >/etc/apt/sources.list.d/kubernetes.list
     deb http://apt.kubernetes.io/ kubernetes-xenial main
 EOF
+
     apt-get update
     apt-get install -y kubelet kubeadm kubectl
     apt-mark hold kubelet kubeadm kubectl
@@ -69,6 +85,10 @@ EOF
 SCRIPT
 
 $configureMaster = <<-SCRIPT
+    # add proxy
+    export http_proxy='http://192.168.56.1:1080/'
+    export https_proxy='http://192.168.56.1:1080/'
+
     echo "This is master"
     # ip of this box
     IP_ADDR=`ifconfig enp0s8 | grep Mask | awk '{print $2}'| cut -f2 -d:`
@@ -84,22 +104,22 @@ $configureMaster = <<-SCRIPT
 
     # install Calico pod network addon
     export KUBECONFIG=/etc/kubernetes/admin.conf
-    kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/rbac-kdd.yaml
-    kubectl apply -f https://raw.githubusercontent.com/ecomm-integration-ballerina/kubernetes-cluster/master/calico/calico.yaml
+    kubectl apply -f https://raw.githubusercontent.com/navono/kubernetes-cluster/master/calico/rbac-kdd.yaml
+    kubectl apply -f https://raw.githubusercontent.com/navono/kubernetes-cluster/master/calico/calico.yaml
 
     kubeadm token create --print-join-command >> /etc/kubeadm_join_cmd.sh
     chmod +x /etc/kubeadm_join_cmd.sh
 
     # required for setting up password less ssh between guest VMs
-    sudo sed -i "/^[^#]*PasswordAuthentication[[:space:]]no/c\PasswordAuthentication yes" /etc/ssh/sshd_config
-    sudo service sshd restart
+    #sudo sed -i "/^[^#]*PasswordAuthentication[[:space:]]no/c\PasswordAuthentication yes" /etc/ssh/sshd_config
+    #sudo service sshd restart
 
 SCRIPT
 
 $configureNode = <<-SCRIPT
     echo "This is worker"
     apt-get install -y sshpass
-    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@192.168.205.10:/etc/kubeadm_join_cmd.sh .
+    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no vagrant@192.168.56.100:/etc/kubeadm_join_cmd.sh .
     sh ./kubeadm_join_cmd.sh
 SCRIPT
 
@@ -113,10 +133,14 @@ Vagrant.configure("2") do |config|
             config.vm.hostname = opts[:name]
             config.vm.network :private_network, ip: opts[:eth1]
 
+            # need install plugin
+            # vagrant plugin install vagrant-disksize
+            config.disksize.size = '150GB'
+
             config.vm.provider "virtualbox" do |v|
 
                 v.name = opts[:name]
-            	 v.customize ["modifyvm", :id, "--groups", "/Ballerina Development"]
+                v.customize ["modifyvm", :id, "--groups", "/k8s Development"]
                 v.customize ["modifyvm", :id, "--memory", opts[:mem]]
                 v.customize ["modifyvm", :id, "--cpus", opts[:cpu]]
 
@@ -132,9 +156,6 @@ Vagrant.configure("2") do |config|
             else
                 config.vm.provision "shell", inline: $configureNode
             end
-
         end
-
     end
-
 end 
